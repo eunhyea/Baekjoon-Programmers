@@ -1,7 +1,12 @@
-# 2750
+# Read the number of elements
 n = int(input())
-li =[]
-for i in range(1,n+1):
-    li.append(int(input()))
-for i in range(n):
-    print(sorted(li)[i])
+
+# Collect all input elements
+li = [int(input()) for _ in range(n)]
+
+# Sort the list once
+li.sort()
+
+# Print sorted elements
+for element in li:
+    print(element)
