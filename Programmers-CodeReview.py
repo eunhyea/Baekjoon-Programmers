@@ -23,3 +23,9 @@ def solution(dot):
 # 입문/피자 나눠먹기(3) : 올림 계산하기
 def solution(slice, n):
     return ((n - 1) // slice) + 1
+
+# 입문/가위 바위 보 : 딕셔너리 자료형 사용하기 
+def solution(rsp):
+    win = {'0':'5', '2':'0', '5':'2'}
+    answer = [win[chr] for chr in rsp]
+    return ''.join(answer)
