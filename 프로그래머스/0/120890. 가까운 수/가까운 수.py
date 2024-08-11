@@ -13,3 +13,8 @@ def solution(array, n):
     # n보다 큰 가까운 값
     if n_close > p_close:
         return n+p_close
+
+# sort에서 key인자 여러 개로 정렬하기
+def solution(array, n):
+    array.sort(key=lambda x: (abs(x-n), x))
+    return arrar[0]
