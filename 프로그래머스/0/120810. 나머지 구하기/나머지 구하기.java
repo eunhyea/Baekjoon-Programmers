@@ -1,6 +1,6 @@
 class Solution {
-    public float solution(float num1, float num2) {
-        float answer = num1 % num2;
+    public int solution(int num1, int num2) {
+        int answer = num1 % num2;
         
         return answer;
     }
