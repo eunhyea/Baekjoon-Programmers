@@ -1,8 +1,14 @@
 def solution(sizes):
-    w_set = set()
-    h_set = set()
+    max_long = 0 
+    max_short = 0
+    
     for w,h in sizes:
-        w_set.add(min(w,h))
-        h_set.add(max(w,h))
-    answer = max(w_set)*max(h_set)
+        long = max(w,h)
+        short = min(w,h)
+        
+        if max_long < long:
+            max_long = long
+        if max_short < short:
+            max_short = short
+    answer = max_long * max_short
     return answer
