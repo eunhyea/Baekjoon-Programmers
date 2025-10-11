@@ -98,15 +98,26 @@ def get_file_raw(owner: str, repo: str, path: str, ref: str) -> Optional[str]:
 # OpenAI 분류기 (간단)
 # -------------------
 def classify_with_openai(code: str) -> dict:
+    """
+    OpenAI에 JSON만 출력하라 강제 프롬프트를 보내고,
+    응답에서 JSON 객체를 추출해서 파싱을 시도합니다.
+    (엄격 JSON이 아니면 fallback 요약을 반환)
+    """
     if not OPENAI_API_KEY:
         return {"tags": [], "difficulty": "unknown", "summary": "no api key", "time_complexity": ""}
-    prompt = f"""
-다음은 코딩 테스트 풀이 코드입니다. 이 코드에 대해
-1) 알고리즘/패턴 태그(최대 3개, 예: DP, BFS, 그리디, 투포인터, 정렬 등),
-2) 난이도(쉬움/중간/어려움),
-3) 한줄 요약(한국어),
-4) 시간복잡도 추정(O(...) 형태)
-를 JSON으로 출력하세요. 반드시 JSON만 출력하세요.
+
+    prompt = """
+당신은 코딩테스트 문제 풀이 코드를 보고 '알고리즘 태그'를 분류하는 도우미입니다.
+아래 요구사항을 **반드시 지키세요**:
+1) 출력은 **오직 하나의 JSON 객체만**으로 제한합니다. 그 외 어떠한 텍스트도 출력하지 마세요.
+2) JSON 스키마:
+{
+  "tags": ["DP","그리디"],          // 최대 3개 문자열 태그
+  "difficulty": "쉬움"|"중간"|"어려움",
+  "summary": "한국어 한 문장 요약",
+  "time_complexity": "O(n log n)"  // 가능하면 표기
+}
+아래 코드만 보고 판단하세요. 코드 외 설명을 출력하지 마세요.
 
 코드:
 {code[:3000]}
@@ -122,22 +133,37 @@ def classify_with_openai(code: str) -> dict:
     except Exception as e:
         print("[ERROR] OpenAI request exception:", e)
         return {"tags": ["unknown"], "difficulty": "unknown", "summary": str(e)[:200], "time_complexity": ""}
+
     print("[OpenAI] status_code:", r.status_code)
-    if r.status_code != 200:
-        print("[OpenAI] body:", r.text[:800])
-        return {"tags": ["unknown"], "difficulty": "unknown", "summary": f"OpenAI error {r.status_code}", "time_complexity": ""}
+    text = ""
     try:
         text = r.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        print("[ERROR] OpenAI response parsing failed:", e)
-        print("body:", r.text[:800])
+        print("[ERROR] OpenAI response parsing failed:", e, r.text[:800])
         return {"tags": ["unknown"], "difficulty": "unknown", "summary": r.text[:200], "time_complexity": ""}
+
+    # 1) 우선 시도: 전체가 JSON인지 확인
     try:
         parsed = json.loads(text)
+        return parsed
     except Exception:
-        print("[WARN] OpenAI did not return strict JSON; using raw text as summary")
-        parsed = {"tags": ["unknown"], "difficulty": "unknown", "summary": text.strip()[:400], "time_complexity": ""}
-    return parsed
+        pass
+
+    # 2) 응답에서 첫 번째 '{'부터 마지막 '}' 까지 잘라서 파싱 시도 (간단한 회복 로직)
+    try:
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end+1]
+            parsed = json.loads(candidate)
+            return parsed
+    except Exception as e:
+        print("[WARN] JSON extraction failed:", e)
+
+    # 3) 최종 fallback: 전체 원문을 summary로 사용
+    print("[WARN] OpenAI did not return strict JSON; using raw text as summary")
+    return {"tags": ["unknown"], "difficulty": "unknown", "summary": text.strip()[:400], "time_complexity": ""}
+
 
 # -------------------
 # Notion에 페이지 생성
@@ -152,21 +178,45 @@ def create_notion_page(meta: dict):
         "Notion-Version": "2022-06-28",
         "Content-Type": "application/json"
     }
+
+    # Notion은 paragraph -> rich_text, code -> rich_text 형식을 기대합니다.
+    children = []
+    summary_text = meta.get("summary", "")
+    if summary_text:
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": summary_text}}
+                ]
+            }
+        })
+    # 코드 블록(선택사항) — 길면 자르기
+    code_snippet = meta.get("code_snippet", "")
+    if code_snippet:
+        # Notion code block expects "rich_text"
+        children.append({
+            "object": "block",
+            "type": "code",
+            "code": {
+                "rich_text": [
+                    {"type": "text", "text": {"content": code_snippet}}
+                ],
+                "language": meta.get("language", "python")
+            }
+        })
+
     properties = {
         "Name": {"title": [{"text": {"content": meta.get("title", "Unknown")}}]},
-        "Platform": {"select": {"name": meta.get("platform", "GitHub")}},
+        "Platform": {"multi_select": {"name": meta.get("platform", "GitHub")}},
         "Algorithm": {"multi_select": [{"name": t} for t in meta.get("tags", [])]},
-        "Difficulty": {"select": {"name": meta.get("difficulty", "Unknown")}},
-        "Language": {"select": {"name": meta.get("language", "Python")}},
+        "Difficulty": {"multi_select": {"name": meta.get("difficulty", "Unknown")}},
+        "Language": {"multi_select": {"name": meta.get("language", "Python")}},
         "URL": {"url": meta.get("url")},
     }
-    payload = {
-        "parent": {"database_id": NOTION_DB_ID},
-        "properties": properties,
-        "children": [
-            {"object": "block", "type": "paragraph", "paragraph": {"text": [{"type": "text", "text": {"content": meta.get("summary", "")}}]}}
-        ]
-    }
+    payload = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties, "children": children}
+
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=20)
     except Exception as e:
@@ -174,9 +224,10 @@ def create_notion_page(meta: dict):
         return
     print("[Notion] status_code:", r.status_code)
     if r.status_code not in (200, 201):
-        print("[WARN] Notion create failed:", r.status_code, r.text[:800])
+        print("[WARN] Notion create failed:", r.status_code, r.text[:1000])
     else:
         print("[OK] Notion page created:", r.json().get("id"))
+
 
 # -------------------
 # 연결 테스트 (디버그용)
