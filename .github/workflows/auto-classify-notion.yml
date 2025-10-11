@@ -1,0 +1,45 @@
+# .github/workflows/auto-classify-notion.yml
+name: Auto classify algorithm & push to Notion
+
+# push가 발생했을 때만 실행 (필요시 branches / paths 세부 설정 가능)
+on:
+  push:
+    # 예: solutions/ 폴더에 있는 문제 풀이 코드가 바뀔 때만 동작하도록 제한
+    paths:
+      - 'solutions/**'
+      - '.github/workflows/auto-classify-notion.yml'  # 워크플로 테스트용
+
+permissions:
+  contents: read   # repo 내용 읽기 (파일 내용 조회)
+  # 다른 권한이 필요하면 추가
+
+jobs:
+  classify_and_notion:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+
+      # 실제 스크립트 실행: 변경된 파일 목록은 GITHUB_EVENT_PATH에서 읽음
+      - name: Run classifier script
+        env:
+          # 반드시 GitHub Secrets에 저장해둔 값들을 사용하세요
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+          # GITHUB_TOKEN은 기본으로 제공되지만 secrets로도 접근 가능
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/classify_and_push.py
