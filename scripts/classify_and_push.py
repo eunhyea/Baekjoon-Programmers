@@ -273,6 +273,19 @@ def _strip_code_fences_and_trailing(text: str) -> str:
     text = re.sub(r"`([^`]+)`", r"\1", text)
     return text.strip()
 
+def _extract_code_fence_jsons(text: str) -> list:
+    """
+    ```json {...} ``` 또는 ``` {...} ``` 같은 코드펜스 블록 안의 내용을 리스트로 반환.
+    각 블록의 앞부분에 'json' 표기가 있으면 제거해서 순수 JSON 문자열로 돌려줍니다.
+    """
+    blocks = []
+    # ``` ... ``` 블록 모두 찾기
+    for m in re.finditer(r"```(?:\s*json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE):
+        inner = m.group(1).strip()
+        # 일부 모델은 ```json { ... } ```가 아니라 ``` { ... } ```로 보낼 수 있음
+        blocks.append(inner)
+    return blocks
+    
 def classify_with_openai(code: str, problem_text: str = "", max_retries: int = 1) -> dict:
     """
     code: 코드 문자열
@@ -320,18 +333,41 @@ def classify_with_openai(code: str, problem_text: str = "", max_retries: int = 1
             print("[ERROR] OpenAI response parse failed:", e, (r.text or "")[:1000])
             last_text = r.text or ""
 
-        # 1) 전체가 JSON인지 시도
+        # 0) 코드펜스 내부 JSON 시도
+        try:
+            code_blocks = _extract_code_fence_jsons(last_text)
+            for block in code_blocks:
+                # 앞에 'json' 키워드가 붙어있거나 주석/설명일 수 있으니, 가능한 경우 JSON 파싱 시도
+                candidate = block.strip()
+                # 어떤 경우에 'json\n{...}' 처럼 줄바꿈 포함될 수 있으니 'json' 접두어 제거
+                candidate = re.sub(r'^\s*json\s*', '', candidate, flags=re.IGNORECASE).strip()
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict):
+                        # 성공적으로 JSON 파싱됨 -> 정상 반환
+                        return {
+                            "tags": parsed.get("tags", []) if isinstance(parsed.get("tags", []), list) else [],
+                            "review": str(parsed.get("review", "")),
+                            "time_complexity": str(parsed.get("time_complexity", ""))
+                        }
+                except Exception:
+                    # 다음 블록 시도
+                    continue
+        except Exception as e:
+            print("[WARN] code-fence JSON extraction failed:", e)
+
+        # 1) 전체 텍스트가 JSON일 가능성
         try:
             parsed = json.loads(last_text)
-            if isinstance(parsed, dict) and ("tags" in parsed or "review" in parsed):
+            if isinstance(parsed, dict):
                 return {
                     "tags": parsed.get("tags", []) if isinstance(parsed.get("tags", []), list) else [],
-                    "review": str(parsed.get("review", ""))[:1200],
-                    "time_complexity": str(parsed.get("time_complexity", ""))[:200]
+                    "review": str(parsed.get("review", "")),
+                    "time_complexity": str(parsed.get("time_complexity", ""))
                 }
         except Exception:
             pass
-
+            
         # 2) 정제 후 중괄호 블록 추출
         stripped = _strip_code_fences_and_trailing(last_text)
         candidate = _extract_first_json_block(stripped)
@@ -362,12 +398,15 @@ def classify_with_openai(code: str, problem_text: str = "", max_retries: int = 1
 
         # 4) 최종 fallback
         print("[WARN] Failed to obtain strict JSON from OpenAI; returning fallback")
-        fallback = {
-            "tags": [],
-            "review": (last_text.strip().replace("\n", " ")[:400] if last_text else "model did not return JSON"),
-            "time_complexity": ""
-        }
-        return fallback
+        # 코드펜스가 있다면 내부 텍스트를 추출해서 가능한 한 깔끔하게 만듦
+        extracted_text = last_text
+        # 제거: ```와 같은 코드펜스 마커만 제거하되 안의 내용은 남김
+        extracted_text = re.sub(r"```(?:\s*json)?\s*", "", extracted_text, flags=re.IGNORECASE)
+        extracted_text = re.sub(r"```", "", extracted_text)
+        extracted_text = extracted_text.strip()
+        # 필요한 경우 줄바꿈을 공백으로 대체
+        extracted_text = re.sub(r'\s+', ' ', extracted_text).strip()
+        return {"tags": [], "review": extracted_text[:1000], "time_complexity": ""}
 
 # -------------------
 # Notion helper: DB schema, wrapping values, create page
