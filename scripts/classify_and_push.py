@@ -209,10 +209,10 @@ def create_notion_page(meta: dict):
 
     properties = {
         "Name": {"title": [{"text": {"content": meta.get("title", "Unknown")}}]},
-        "Platform": {"multi_select": {"name": meta.get("platform", "GitHub")}},
+        "Platform": {"select": {"name": meta.get("platform", "GitHub")}},
         "Algorithm": {"multi_select": [{"name": t} for t in meta.get("tags", [])]},
-        "Difficulty": {"multi_select": {"name": meta.get("difficulty", "Unknown")}},
-        "Language": {"multi_select": {"name": meta.get("language", "Python")}},
+        "Difficulty": {"select": {"name": meta.get("difficulty", "Unknown")}},
+        "Language": {"select": {"name": meta.get("language", "Python")}},
         "URL": {"url": meta.get("url")},
     }
     payload = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties, "children": children}
