@@ -15,6 +15,7 @@ from urllib.parse import quote
 # 환경변수 읽기
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DB_ID = os.getenv("NOTION_DB_ID")
 GITHUB_EVENT_PATH = os.getenv("GITHUB_EVENT_PATH", "/github/workflow/event.json")
@@ -97,72 +98,139 @@ def get_file_raw(owner: str, repo: str, path: str, ref: str) -> Optional[str]:
 # -------------------
 # OpenAI 분류기 (간단)
 # -------------------
-def classify_with_openai(code: str) -> dict:
+def _extract_first_json_block(text: str) -> str | None:
     """
-    OpenAI에 JSON만 출력하라 강제 프롬프트를 보내고,
-    응답에서 JSON 객체를 추출해서 파싱을 시도합니다.
-    (엄격 JSON이 아니면 fallback 요약을 반환)
+    응답 텍스트에서 첫 번째 균형잡힌 중괄호 블록을 추출.
+    단순 regex보다 안정적: 스택으로 중괄호 개수 카운트.
+    """
+    start = text.find('{')
+    if start == -1:
+        return None
+    depth = 0
+    for i in range(start, len(text)):
+        ch = text[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return text[start:i+1]
+    return None
+
+def _strip_code_fences_and_trailing(text: str) -> str:
+    """```...```나 ```json ...``` 같은 코드펜스 제거, 앞뒤 공백 제거"""
+    # 코드펜스 전체를 제거
+    text = re.sub(r"```(?:[\s\S]*?)```", "", text)
+    # 혹은 마크다운 한줄 코드 `...` 제거
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    return text.strip()
+
+def classify_with_openai(code: str, max_retries: int = 1) -> dict:
+    """
+    견고한 LLM 분류기
+    - code: 코드 문자열
+    - 반환: {"tags": [...], "review": "...", "time_complexity": "..."}
     """
     if not OPENAI_API_KEY:
-        return {"tags": [], "difficulty": "unknown", "summary": "no api key", "time_complexity": ""}
+        return {"tags": [], "review": "no api key", "time_complexity": ""}
 
-    prompt = """
-당신은 코딩테스트 문제 풀이 코드를 보고 '알고리즘 태그'를 분류하는 도우미입니다.
-아래 요구사항을 **반드시 지키세요**:
-1) 출력은 **오직 하나의 JSON 객체만**으로 제한합니다. 그 외 어떠한 텍스트도 출력하지 마세요.
-2) JSON 스키마:
+    # 위에서 제안한 엄격한 prompt (few-shot 포함)
+    prompt = f"""
+당신은 코딩테스트 풀이 코드를 보고 알고리즘 태그와 간단한 코드리뷰를 JSON으로 반환하는 도우미입니다.
+**중요**: 절대 다른 텍스트를 출력하지 말고, 오직 하나의 JSON 객체만 출력하세요. 형식은 정확히 아래 JSON 스키마를 따르세요.
+
+스키마:
 {
-  "tags": ["DP","그리디"],          // 최대 3개 문자열 태그
-  "difficulty": "쉬움"|"중간"|"어려움",
-  "summary": "한국어 한 문장 요약",
-  "time_complexity": "O(n log n)"  // 가능하면 표기
+  "tags": ["DP","그리디"],          
+  "review": "제출 코드에 대한 코드리뷰, 정확성 및 효율성 검토(한두 문장)",
+  "time_complexity": "O(n)"          
 }
-아래 코드만 보고 판단하세요. 코드 외 설명을 출력하지 마세요.
 
-코드:
-{code[:3000]}
-"""
+예시1:
+(코드 생략) -> 출력:
+{"tags":["그리디"], "review":"정렬 후 탐색으로 해결. 경계조건 체크 필요.", "time_complexity":"O(n log n)"}
+
+예시2:
+(코드 생략) -> 출력:
+{"tags":["그래프","BFS"], "review":"BFS로 최단 경로 탐색, 방문체크 누락 주의", "time_complexity":"O(V+E)"}
+
+아래 코드만 보고 판단하세요. **다른 설명은 금지**.
+```
+{code}
+```
+    """
+
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "model": "gpt-4o",
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0
-    }
-    try:
-        r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=30)
-    except Exception as e:
-        print("[ERROR] OpenAI request exception:", e)
-        return {"tags": ["unknown"], "difficulty": "unknown", "summary": str(e)[:200], "time_complexity": ""}
+    body = {"model": OPENAI_MODEL, "messages":[{"role":"user","content": prompt.replace("{code}", code)}], "temperature": 0}
 
-    print("[OpenAI] status_code:", r.status_code)
-    text = ""
-    try:
-        text = r.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        print("[ERROR] OpenAI response parsing failed:", e, r.text[:800])
-        return {"tags": ["unknown"], "difficulty": "unknown", "summary": r.text[:200], "time_complexity": ""}
+    attempt = 0
+    last_text = ""
+    while True:
+        attempt += 1
+        try:
+            r = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body, timeout=30)
+        except Exception as e:
+            print("[ERROR] OpenAI request exception:", e)
+            return {"tags": [], "review": f"OpenAI request exception: {e}", "time_complexity": ""}
 
-    # 1) 우선 시도: 전체가 JSON인지 확인
-    try:
-        parsed = json.loads(text)
-        return parsed
-    except Exception:
-        pass
+        print("[OpenAI] status_code:", r.status_code)
+        try:
+            last_text = r.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            print("[ERROR] OpenAI response parse failed:", e, r.text[:1000])
+            last_text = r.text or ""
 
-    # 2) 응답에서 첫 번째 '{'부터 마지막 '}' 까지 잘라서 파싱 시도 (간단한 회복 로직)
-    try:
-        start = text.find('{')
-        end = text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            candidate = text[start:end+1]
-            parsed = json.loads(candidate)
-            return parsed
-    except Exception as e:
-        print("[WARN] JSON extraction failed:", e)
+        # 1) 응답 전체가 JSON일 가능성 시도
+        try:
+            parsed = json.loads(last_text)
+            # 정상 JSON이면 필요한 키가 있는지 검사
+            if isinstance(parsed, dict) and ("tags" in parsed or "review" in parsed):
+                return {
+                    "tags": parsed.get("tags", []) if isinstance(parsed.get("tags", []), list) else [],
+                    "review": str(parsed.get("review", ""))[:1000],
+                    "time_complexity": str(parsed.get("time_complexity", ""))[:200]
+                }
+        except Exception:
+            pass
 
-    # 3) 최종 fallback: 전체 원문을 summary로 사용
-    print("[WARN] OpenAI did not return strict JSON; using raw text as summary")
-    return {"tags": ["unknown"], "difficulty": "unknown", "summary": text.strip()[:400], "time_complexity": ""}
+        # 2) 텍스트 정제 후 균형중괄호 블록 추출
+        stripped = _strip_code_fences_and_trailing(last_text)
+        candidate = _extract_first_json_block(stripped)
+        if candidate:
+            try:
+                parsed = json.loads(candidate)
+                return {
+                    "tags": parsed.get("tags", []) if isinstance(parsed.get("tags", []), list) else [],
+                    "review": str(parsed.get("review", ""))[:1000],
+                    "time_complexity": str(parsed.get("time_complexity", ""))[:200]
+                }
+            except Exception as e:
+                print("[WARN] extracted JSON parse failed:", e, candidate[:800])
+
+        # 3) 재시도(모델에게 '오직 JSON만' 재요청) — 최대 max_retries 번만
+        if attempt <= max_retries:
+            print("[INFO] Attempting one retry asking model to return JSON only")
+            # 재요청 프롬프트: 이전 응답을 첨부하고 JSON만 출력 요청
+            retry_prompt = (
+                "이전 응답에서 JSON이 섞여 나오거나 다른 텍스트가 포함되었습니다. "
+                "아래는 이전 모델 응답입니다. 이 응답에서 **오직 하나의 JSON 객체만** 추출하여, "
+                "아래 스키마에 맞춰 **아무 설명 없이** JSON만 다시 출력해 주세요.\n\n"
+                f"RESPONSE:\n{last_text}\n\n"
+                "스키마: {\"tags\": [..], \"review\": \"..\", \"time_complexity\": \"..\"}"
+            )
+            body = {"model": OPENAI_MODEL, "messages":[{"role":"user","content": retry_prompt}], "temperature": 0}
+            # loop continues and will parse new last_text
+            time.sleep(0.3)
+            continue
+
+        # 4) 최종 fallback: 최소 정보로 반환
+        print("[WARN] Failed to obtain strict JSON from OpenAI; returning fallback")
+        fallback = {
+            "tags": [],
+            "review": (last_text.strip().replace("\n", " ")[:400] if last_text else "model did not return JSON"),
+            "time_complexity": ""
+        }
+        return fallback
 
 
 # -------------------
