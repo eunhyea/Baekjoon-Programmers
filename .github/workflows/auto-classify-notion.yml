@@ -1,31 +1,76 @@
-# .github/workflows/auto-classify-notion.yml 의 steps에 아래를 Run classifier script 전에 넣으세요
-- name: Debug: show event path and event (first 2000 chars)
-  run: |
-    echo "GITHUB_EVENT_PATH=$GITHUB_EVENT_PATH"
-    echo "Listing event file:"
-    if [ -f "$GITHUB_EVENT_PATH" ]; then
-      echo "=== event.json (first 2000 chars) ==="
-      head -c 2000 "$GITHUB_EVENT_PATH" || true
-      echo
-    else
-      echo "No event file at $GITHUB_EVENT_PATH"
-    fi
+# .github/workflows/auto-classify-notion.yml
+name: Auto classify algorithm & push to Notion
 
-- name: Debug: show changed files from event (quick parse)
-  run: |
-    if [ -f "$GITHUB_EVENT_PATH" ]; then
-      python - <<'PY'
-import json,os
-p=os.environ.get("GITHUB_EVENT_PATH")
-with open(p,encoding="utf-8") as f:
-    e=json.load(f)
-commits=e.get("commits",[])
-print("num_commits:", len(commits))
-files=[]
-for c in commits:
-    files+=c.get("added",[])+c.get("modified",[])+c.get("removed",[])
-print("changed files sample (first 50):", files[:50])
-PY
-    else
-      echo "No event file to parse"
-    fi
+# push가 발생했을 때만 실행 (필요시 branches / paths 세부 설정 가능)
+on:
+  push:
+    # 예: solutions/ 폴더에 있는 문제 풀이 코드가 바뀔 때만 동작하도록 제한
+    paths:
+      - '백준/**'
+      - '프로그래머스/**'
+      - '.github/workflows/auto-classify-notion.yml'  # 워크플로 테스트용
+
+permissions:
+  contents: read   # repo 내용 읽기 (파일 내용 조회)
+  # 다른 권한이 필요하면 추가
+
+jobs:
+  classify_and_notion:
+    runs-on: ubuntu-latest
+    environment: ct_notion
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r scripts/requirements.txt
+      # .github/workflows/auto-classify-notion.yml 의 steps에 아래를 Run classifier script 전에 넣으세요
+      - name: Debug- show event path and event (first 2000 chars)
+        run: |
+          echo "GITHUB_EVENT_PATH=$GITHUB_EVENT_PATH"
+          echo "Listing event file:"
+          if [ -f "$GITHUB_EVENT_PATH" ]; then
+            echo "=== event.json (first 2000 chars) ==="
+            head -c 2000 "$GITHUB_EVENT_PATH" || true
+            echo
+          else
+            echo "No event file at $GITHUB_EVENT_PATH"
+          fi
+        
+      - name: Debug- show changed files from event (quick parse)
+        run: |
+          if [ -f "$GITHUB_EVENT_PATH" ]; then
+            python - <<'PY'
+          import json,os
+          p=os.environ.get("GITHUB_EVENT_PATH")
+          with open(p,encoding="utf-8") as f:
+              e=json.load(f)
+          commits=e.get("commits",[])
+          print("num_commits:", len(commits))
+          files=[]
+          for c in commits:
+              files+=c.get("added",[])+c.get("modified",[])+c.get("removed",[])
+          print("changed files sample (first 50):", files[:50])
+          PY
+              else
+                echo "No event file to parse"
+              fi
+
+      # 실제 스크립트 실행: 변경된 파일 목록은 GITHUB_EVENT_PATH에서 읽음
+      - name: Run classifier script
+        env:
+          # 반드시 GitHub Secrets에 저장해둔 값들을 사용하세요
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
+        run: |
+          python scripts/classify_and_push.py
