@@ -715,8 +715,8 @@ def main():
             }
             create_notion_page(meta)
 
-    except Exception:
-        print("=== UNCAUGHT EXCEPTION ===")
+    except Exception as e:
+        print("=== UNCAUGHT EXCEPTION ===", e)
         traceback.print_exc()
         sys.exit(1)
 
