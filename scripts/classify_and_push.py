@@ -247,7 +247,7 @@ def parse_readme(text: str) -> dict:
         "difficulty": difficulty,
         "problem_text": prob_text,
         "classification_text": class_text,
-        "classification_tags": class_tags
+        "classification_tags": classification_tags
     }
 
 # -------------------
