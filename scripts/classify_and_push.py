@@ -1,21 +1,23 @@
 # scripts/classify_and_push.py
-# 디버그 모드 + 실제 처리 로직 통합 버전
-# 워크플로에서 실행될 때 환경변수가 주입되었다고 가정합니다.
-# - 필수 env: GITHUB_TOKEN, OPENAI_API_KEY, NOTION_TOKEN, NOTION_DB_ID
-# - Python 3.11 로 실행 권장 (type union, f-strings 등 사용)
+# 디버그 + 실제 처리 통합 버전 (Python 3.11 권장)
+# 주석은 이해하기 쉽게 한국어로 달아뒀습니다.
 
 import os
 import sys
 import json
+import time
 import requests
 import traceback
+import re
 from typing import List, Optional
 from urllib.parse import quote
+from html import unescape
 
 # 환경변수 읽기
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL")
+# 사용자가 OPENAI_MODEL을 env로 주지 않으면 기본값 사용
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DB_ID = os.getenv("NOTION_DB_ID")
 GITHUB_EVENT_PATH = os.getenv("GITHUB_EVENT_PATH", "/github/workflow/event.json")
@@ -28,6 +30,7 @@ def print_envs():
     print("[ENV] OPENAI_API_KEY present" if OPENAI_API_KEY else "[ENV-ERR] OPENAI_API_KEY missing")
     print("[ENV] NOTION_TOKEN present" if NOTION_TOKEN else "[ENV-ERR] NOTION_TOKEN missing")
     print("[ENV] NOTION_DB_ID present" if NOTION_DB_ID else "[ENV-ERR] NOTION_DB_ID missing")
+    print("[ENV] OPENAI_MODEL:", OPENAI_MODEL)
     print("[ENV] GITHUB_EVENT_PATH:", GITHUB_EVENT_PATH)
 
 def read_event() -> dict:
@@ -37,7 +40,6 @@ def read_event() -> dict:
     with open(GITHUB_EVENT_PATH, "r", encoding="utf-8") as f:
         e = json.load(f)
     print("[EVENT] loaded event, length:", len(json.dumps(e, ensure_ascii=False)))
-    # 처음 2000자만 출력해 확인
     s = json.dumps(e, ensure_ascii=False)
     print(s[:2000])
     return e
@@ -96,13 +98,162 @@ def get_file_raw(owner: str, repo: str, path: str, ref: str) -> Optional[str]:
         return None
 
 # -------------------
-# OpenAI 분류기 (간단)
+# README.md 파서 (difficulty, url, perf, classification, problem_text 등)
 # -------------------
-def _extract_first_json_block(text: str) -> str | None:
+def parse_readme(text: str) -> dict:
     """
-    응답 텍스트에서 첫 번째 균형잡힌 중괄호 블록을 추출.
-    단순 regex보다 안정적: 스택으로 중괄호 개수 카운트.
+    README.md 텍스트를 받아서 다음 항목을 추출하여 dict로 반환.
+    - problem_url
+    - perf_memory
+    - perf_time
+    - difficulty
+    - problem_text
+    - classification_text
+    - classification_tags
     """
+    if not text:
+        return {
+            "problem_url": "", "perf_memory": "", "perf_time": "",
+            "difficulty": "", "problem_text": "",
+            "classification_text": "", "classification_tags": []
+        }
+
+    # 0) difficulty 추출 (README 첫 번째 의미있는 라인에서 [..] 내용)
+    difficulty = ""
+    first_line = ""
+    for ln in text.splitlines():
+        if ln.strip():
+            first_line = ln.strip()
+            break
+    if first_line:
+        m_diff = re.search(r'\[([^\]]+)\]', first_line)
+        if m_diff:
+            difficulty = m_diff.group(1).strip()
+
+    # 1) [문제 링크](url) or first url
+    url_match = re.search(r'\[문제\s*링크\]\s*\(\s*(https?://[^\s\)]+)\s*\)', text)
+    if not url_match:
+        url_match = re.search(r'https?://[^\s\)]+', text)
+    problem_url = url_match.group(1) if url_match else ""
+
+    # 2) perf: memory/time
+    mem_match = re.search(r'메모리[:\s]*([\d\.]+\s*MB)', text, flags=re.IGNORECASE)
+    time_match = re.search(r'시간[:\s]*([\d\.]+\s*ms)', text, flags=re.IGNORECASE)
+    perf_memory = mem_match.group(1) if mem_match else ""
+    perf_time = time_match.group(1) if time_match else ""
+
+    # cleaning util
+    def _clean_block(block: str) -> str:
+        # 코드블럭 제거
+        block = re.sub(r"```[\s\S]*?```", "", block)
+        # 인라인 코드 `...` -> 내용만 남기기
+        block = re.sub(r'`([^`]+)`', r'\1', block)
+        # HTML 태그 제거
+        block = re.sub(r'<[^>]+>', '', block)
+        # 여러 공백(유니코드 포함)을 일반 공백으로 바꾸고 줄 단위로 정리
+        block = re.sub(r'[\u00A0\u2000-\u200A\u202F]', ' ', block)
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        return unescape("\n".join(lines)).strip()
+
+    # 3) classification 섹션
+    class_blocks = []
+    # 헤딩 '분류' 또는 '구분' (1~6 레벨) 뒤의 블록들을 모두 찾음
+    pattern = re.compile(r'#{1,6}\s*(?:분류|구분)\s*[\r\n]+([\s\S]+?)(?=\n#{1,6}\s|\n-{3,}\n|$)', flags=re.IGNORECASE)
+    for m in pattern.finditer(text):
+        raw = m.group(1)
+        cleaned = _clean_block(raw)
+        if cleaned:
+            class_blocks.append(cleaned)
+
+    class_text = "\n\n".join(class_blocks) if class_blocks else ""
+
+    # ------------------
+    # 각 블록을 태그로 토큰화
+    # 전략:
+    # 1) '>'로 경로 표시하면 각 경로 조각을 태그로 사용 (계층적 정보 유지)
+    # 2) 아니면 줄 단위 목록 -> 각 줄을 항목으로 사용
+    # 3) 한 줄의 경우 쉼표/슬래시/파이프/중점 등으로 분리, 없으면 공백으로 분리
+    # 4) 괄호 내용 제거, 앞뒤 공백 제거
+    # ------------------
+    tags = []
+    def _normalize_tag(t: str) -> str:
+        t = re.sub(r'\(.*?\)', '', t)            # 괄호 안 내용 제거
+        t = re.sub(r'[\u2000-\u200A\u00A0\u202F]', ' ', t)  # 특수 공백 정리
+        t = t.replace('\uFEFF', '').strip()      # BOM 제거 가능성
+        return re.sub(r'\s{2,}', ' ', t).strip()
+
+    for block in class_blocks:
+        # 우선 '>' 기반 분리 시도 (경로 표기)
+        if '>' in block:
+            parts = [p.strip() for p in re.split(r'\s*>\s*', block) if p.strip()]
+            # 각 부분을 정제하여 추가 (예: "탐욕법(Greedy)" -> "탐욕법")
+            for p in parts:
+                nt = _normalize_tag(p)
+                if nt and len(nt) > 0:
+                    if nt not in tags:
+                        tags.append(nt)
+            # 또한 경로 전체(가장 상세한 경로)를 태그로 추가할 수도 있음 (옵션)
+            # full_path = " > ".join([_normalize_tag(p) for p in parts if _normalize_tag(p)])
+            # if full_path and full_path not in tags:
+            #     tags.append(full_path)
+            continue
+
+        # 줄 단위로 목록이 있으면 각 줄 처리
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if len(lines) > 1:
+            for ln in lines:
+                ln_clean = re.sub(r'^[\-\*\•\·\s]+', '', ln).strip()
+                # 분리자로 나누기
+                parts = re.split(r'[,\|/;·•\u2022\u2023]+', ln_clean)
+                if len(parts) == 1:
+                    parts = re.split(r'[\s]+', ln_clean)
+                for p in parts:
+                    nt = _normalize_tag(p)
+                    if nt and len(nt) > 0 and len(nt) > 1:
+                        if nt not in tags:
+                            tags.append(nt)
+            continue
+
+        # 단일라인 블록: 구분자(콤마 등)로 분리, 없으면 공백 분리
+        single = lines[0] if lines else block
+        parts = re.split(r'[,\|/;·•\u2022\u2023]+', single)
+        if len(parts) == 1:
+            parts = re.split(r'[\s]+', single)
+        for p in parts:
+            nt = _normalize_tag(p)
+            if nt and len(nt) > 0 and len(nt) > 1:
+                if nt not in tags:
+                    tags.append(nt)
+
+    # 필터: 너무 짧은 토큰(1 char) 제외, 중복은 이미 제거됨
+    classification_tags = [t for t in tags if len(t) > 1]
+
+    # 4) problem description
+    prob_text = ""
+    m = re.search(r'#{1,6}\s*문제\s*설명\s*[\r\n]+([\s\S]+?)(?:\n#{1,6}\s|\n-{3,}\n|$)', text)
+    if m:
+        block = m.group(1)
+        block = _clean_block(block)
+        lines = block.splitlines()
+        prob_text = " ".join(lines[:6]) if lines else ""
+    else:
+        s = _clean_block(text)
+        prob_text = " ".join(s.splitlines()[:6])
+
+    return {
+        "problem_url": problem_url,
+        "perf_memory": perf_memory,
+        "perf_time": perf_time,
+        "difficulty": difficulty,
+        "problem_text": prob_text,
+        "classification_text": class_text,
+        "classification_tags": class_tags
+    }
+
+# -------------------
+# OpenAI 분류기 (problem_text 옵션 추가, robust JSON parsing)
+# -------------------
+def _extract_first_json_block(text: str) -> Optional[str]:
     start = text.find('{')
     if start == -1:
         return None
@@ -118,50 +269,39 @@ def _extract_first_json_block(text: str) -> str | None:
     return None
 
 def _strip_code_fences_and_trailing(text: str) -> str:
-    """```...```나 ```json ...``` 같은 코드펜스 제거, 앞뒤 공백 제거"""
-    # 코드펜스 전체를 제거
     text = re.sub(r"```(?:[\s\S]*?)```", "", text)
-    # 혹은 마크다운 한줄 코드 `...` 제거
     text = re.sub(r"`([^`]+)`", r"\1", text)
     return text.strip()
 
-def classify_with_openai(code: str, max_retries: int = 1) -> dict:
+def classify_with_openai(code: str, problem_text: str = "", max_retries: int = 1) -> dict:
     """
-    견고한 LLM 분류기
-    - code: 코드 문자열
-    - 반환: {"tags": [...], "review": "...", "time_complexity": "..."}
+    code: 코드 문자열
+    problem_text: (옵션) README에서 추출한 문제 설명을 문자열로 전달
+    반환: {"tags":[...], "review": "...", "time_complexity": "..."}
     """
     if not OPENAI_API_KEY:
         return {"tags": [], "review": "no api key", "time_complexity": ""}
 
-    # 위에서 제안한 엄격한 prompt (few-shot 포함)
+    # 엄격한 JSON 출력 요구 + few-shot(짧게)
     prompt = f"""
 당신은 코딩테스트 풀이 코드를 보고 알고리즘 태그와 간단한 코드리뷰를 JSON으로 반환하는 도우미입니다.
 **중요**: 절대 다른 텍스트를 출력하지 말고, 오직 하나의 JSON 객체만 출력하세요. 형식은 정확히 아래 JSON 스키마를 따르세요.
 
 스키마:
-{
-  "tags": ["DP","그리디"],          
-  "review": "제출 코드에 대한 코드리뷰, 정확성 및 효율성 검토(한두 문장)",
-  "time_complexity": "O(n)"          
-}
+{{"tags": ["DP","그리디"], "review": "코드에 대한 간단한 리뷰(한두 문장)", "time_complexity": "O(n)"}}
 
-예시1:
-(코드 생략) -> 출력:
-{"tags":["그리디"], "review":"정렬 후 탐색으로 해결. 경계조건 체크 필요.", "time_complexity":"O(n log n)"}
+예시:
+{{"tags":["그리디"], "review":"정렬 후 탐색으로 해결. 경계조건 체크 필요.", "time_complexity":"O(n log n)"}}
 
-예시2:
-(코드 생략) -> 출력:
-{"tags":["그래프","BFS"], "review":"BFS로 최단 경로 탐색, 방문체크 누락 주의", "time_complexity":"O(V+E)"}
-
-아래 코드만 보고 판단하세요. **다른 설명은 금지**.
-```
+아래 문제 설명(있으면)과 코드를 참고하여 태그와 리뷰를 작성하세요.
+문제 설명:
+{problem_text}
+코드:
 {code}
-```
-    """
+"""
 
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {"model": OPENAI_MODEL, "messages":[{"role":"user","content": prompt.replace("{code}", code)}], "temperature": 0}
+    body = {"model": OPENAI_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0}
 
     attempt = 0
     last_text = ""
@@ -177,23 +317,22 @@ def classify_with_openai(code: str, max_retries: int = 1) -> dict:
         try:
             last_text = r.json()["choices"][0]["message"]["content"]
         except Exception as e:
-            print("[ERROR] OpenAI response parse failed:", e, r.text[:1000])
+            print("[ERROR] OpenAI response parse failed:", e, (r.text or "")[:1000])
             last_text = r.text or ""
 
-        # 1) 응답 전체가 JSON일 가능성 시도
+        # 1) 전체가 JSON인지 시도
         try:
             parsed = json.loads(last_text)
-            # 정상 JSON이면 필요한 키가 있는지 검사
             if isinstance(parsed, dict) and ("tags" in parsed or "review" in parsed):
                 return {
                     "tags": parsed.get("tags", []) if isinstance(parsed.get("tags", []), list) else [],
-                    "review": str(parsed.get("review", ""))[:1000],
+                    "review": str(parsed.get("review", ""))[:1200],
                     "time_complexity": str(parsed.get("time_complexity", ""))[:200]
                 }
         except Exception:
             pass
 
-        # 2) 텍스트 정제 후 균형중괄호 블록 추출
+        # 2) 정제 후 중괄호 블록 추출
         stripped = _strip_code_fences_and_trailing(last_text)
         candidate = _extract_first_json_block(stripped)
         if candidate:
@@ -201,7 +340,7 @@ def classify_with_openai(code: str, max_retries: int = 1) -> dict:
                 parsed = json.loads(candidate)
                 return {
                     "tags": parsed.get("tags", []) if isinstance(parsed.get("tags", []), list) else [],
-                    "review": str(parsed.get("review", ""))[:1000],
+                    "review": str(parsed.get("review", ""))[:1200],
                     "time_complexity": str(parsed.get("time_complexity", ""))[:200]
                 }
             except Exception as e:
@@ -210,20 +349,18 @@ def classify_with_openai(code: str, max_retries: int = 1) -> dict:
         # 3) 재시도(모델에게 '오직 JSON만' 재요청) — 최대 max_retries 번만
         if attempt <= max_retries:
             print("[INFO] Attempting one retry asking model to return JSON only")
-            # 재요청 프롬프트: 이전 응답을 첨부하고 JSON만 출력 요청
             retry_prompt = (
                 "이전 응답에서 JSON이 섞여 나오거나 다른 텍스트가 포함되었습니다. "
                 "아래는 이전 모델 응답입니다. 이 응답에서 **오직 하나의 JSON 객체만** 추출하여, "
-                "아래 스키마에 맞춰 **아무 설명 없이** JSON만 다시 출력해 주세요.\n\n"
+                "아무 설명 없이 JSON만 다시 출력해 주세요.\n\n"
                 f"RESPONSE:\n{last_text}\n\n"
-                "스키마: {\"tags\": [..], \"review\": \"..\", \"time_complexity\": \"..\"}"
+                '스키마: {"tags": [..], "review": "..", "time_complexity": ".."}'
             )
             body = {"model": OPENAI_MODEL, "messages":[{"role":"user","content": retry_prompt}], "temperature": 0}
-            # loop continues and will parse new last_text
             time.sleep(0.3)
             continue
 
-        # 4) 최종 fallback: 최소 정보로 반환
+        # 4) 최종 fallback
         print("[WARN] Failed to obtain strict JSON from OpenAI; returning fallback")
         fallback = {
             "tags": [],
@@ -232,28 +369,18 @@ def classify_with_openai(code: str, max_retries: int = 1) -> dict:
         }
         return fallback
 
-
 # -------------------
-# Notion에 페이지 생성
+# Notion helper: DB schema, wrapping values, create page
 # -------------------
-# Notion에 페이지 생성 (DB 스키마 읽어서 안전하게 매핑)
-# 기존의 create_notion_page 함수를 아래로 대체하세요.
-
-_DB_SCHEMA_CACHE = None  # 프로세스 내 캐시
+_DB_SCHEMA_CACHE = None
 
 def get_database_schema():
-    """
-    Notion 데이터베이스의 properties 스키마를 가져와서 캐시합니다.
-    반환값: dict of { property_name: property_schema_dict }
-    """
     global _DB_SCHEMA_CACHE
     if _DB_SCHEMA_CACHE is not None:
         return _DB_SCHEMA_CACHE
-
     if not NOTION_TOKEN or not NOTION_DB_ID:
         print("[WARN] Notion creds missing - cannot fetch DB schema")
         return {}
-
     url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28"}
     try:
@@ -264,7 +391,6 @@ def get_database_schema():
     if r.status_code != 200:
         print("[WARN] get_database_schema failed:", r.status_code, r.text[:1000])
         return {}
-
     data = r.json()
     props = data.get("properties", {})
     _DB_SCHEMA_CACHE = props
@@ -272,13 +398,7 @@ def get_database_schema():
     return props
 
 def _wrap_value_for_property(prop_schema: dict, value):
-    """
-    prop_schema: Notion property schema for that property (dict)
-    value: meta 값 (str or list)
-    반환: property payload (dict) - ready to put under properties[property_name]
-    """
     ptype = prop_schema.get("type")
-    # 안전한 변환들
     if ptype == "title":
         return {"title": [{"text": {"content": str(value)}}]}
     if ptype == "rich_text":
@@ -286,7 +406,6 @@ def _wrap_value_for_property(prop_schema: dict, value):
     if ptype == "select":
         return {"select": {"name": str(value)}}
     if ptype == "multi_select":
-        # value가 리스트면 각각 처리, 아니면 하나로 만듦
         if isinstance(value, (list, tuple)):
             return {"multi_select": [{"name": str(v)} for v in value]}
         else:
@@ -301,145 +420,129 @@ def _wrap_value_for_property(prop_schema: dict, value):
     if ptype == "checkbox":
         return {"checkbox": bool(value)}
     if ptype == "date":
-        # value가 ISO 날짜 문자열이면 그대로 넣음 (예: "2025-10-11")
         return {"date": {"start": str(value)}}
     if ptype == "people":
-        # 사람은 id를 넣어야 하므로 기본으로 빈 배열
         return {"people": []}
-    # fallback: rich_text로 넣기 (안전)
     return {"rich_text": [{"type": "text", "text": {"content": str(value)}}]}
 
 def create_notion_page(meta: dict):
     """
     meta: {
-      title, platform, tags(list), difficulty, language, url, summary, code_snippet
+      title, platform, tags(list), difficulty, language, url,
+      problem_text, classification_text, review, time_complexity,
+      perf_memory, perf_time, code_snippet
     }
-    이 함수를 사용하면 DB 스키마에 맞춰 properties를 생성해서 Notion에 페이지를 만듭니다.
+    DB 스키마에 따라 properties를 안전하게 포장하고,
+    children에 problem_text/classification_text/review/perf/code를 추가합니다.
     """
     if not NOTION_TOKEN or not NOTION_DB_ID:
         print("[WARN] Notion creds missing, skipping create")
         return
 
-    # 1) DB 스키마 로드
     schema = get_database_schema()
-    if not schema:
-        print("[WARN] DB schema unavailable, attempt minimal create with children only")
     properties_payload = {}
 
-    # mapping: 메타 필드명 -> Notion DB 컬럼명 (사용자 DB 컬럼명이 다르다면 여기를 수정)
-    # 보통 스크린샷대로라면 "Name", "Platform", "Algorithm", "Difficulty", "Language", "URL"
-    # 필요시 여기에 DB 컬럼명과 meta 키를 조정하세요.
     mapping = {
         "Name": meta.get("title", ""),
         "Platform": meta.get("platform", ""),
-        "Algorithm": meta.get("tags", []),      # list expected
+        "Algorithm": meta.get("tags", []),
         "Difficulty": meta.get("difficulty", ""),
         "Language": meta.get("language", ""),
         "URL": meta.get("url", "")
     }
 
-    # 2) schema에 맞게 properties 구성
     for prop_name, val in mapping.items():
         if prop_name not in schema:
-            # DB에 해당 컬럼이 없으면 건너뜀 (또는 fallback으로 rich_text 필드에 추가)
             print(f"[INFO] property '{prop_name}' not found in DB schema - skipping")
             continue
         prop_schema = schema[prop_name]
         wrapped = _wrap_value_for_property(prop_schema, val)
         properties_payload[prop_name] = wrapped
 
-    # 3) children (summary + code) - Notion이 요구하는 형식으로 생성
+    # children: 순서대로 문제링크/문제설명/분류/성능/리뷰/코드
     children = []
-    summary_text = meta.get("summary", "")
-    if summary_text:
+
+    # 1) 문제 URL을 명시적으로 보여주려면 paragraph + link 텍스트로 추가
+    if meta.get("url"):
         children.append({
             "object": "block",
             "type": "paragraph",
             "paragraph": {
                 "rich_text": [
-                    {"type": "text", "text": {"content": summary_text}}
+                    {"type": "text", "text": {"content": f"문제 링크: {meta.get('url')}", "link": {"url": meta.get("url")}}}
                 ]
             }
         })
+
+    # 2) 문제 설명
+    if meta.get("problem_text"):
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": meta.get("problem_text")}}]}
+        })
+
+    # 3) classification_text (README의 분류 섹션 원문)
+    if meta.get("classification_text"):
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"분류(README): {meta.get('classification_text')}"}}]}
+        })
+
+    # 4) 성능 요약
+    perf_lines = []
+    if meta.get("perf_memory"):
+        perf_lines.append(f"메모리: {meta.get('perf_memory')}")
+    if meta.get("perf_time"):
+        perf_lines.append(f"시간: {meta.get('perf_time')}")
+    if perf_lines:
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": " | ".join(perf_lines)}}]}
+        })
+
+    # 5) LLM 리뷰 및 시간복잡도
+    if meta.get("review"):
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"LLM 리뷰: {meta.get('review')}"}}]}
+        })
+    if meta.get("time_complexity"):
+        children.append({
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": [{"type": "text", "text": {"content": f"추정 시간복잡도: {meta.get('time_complexity')}"}}]}
+        })
+
+    # 6) 코드 블록 (길면 자름)
     code_snippet = meta.get("code_snippet", "")
     if code_snippet:
-        allowed_languages = {
-            "abap","abc","agda","arduino","ascii art","assembly","bash","basic","bnf","c","c#","c++",
-            "clojure","coffeescript","coq","css","dart","dhall","diff","docker","ebnf","elixir","elm",
-            "erlang","f#","flow","fortran","gherkin","glsl","go","graphql","groovy","haskell","hcl","html",
-            "idris","java","javascript","json","julia","kotlin","latex","less","lisp","livescript","llvm ir",
-            "lua","makefile","markdown","markup","matlab","mathematica","mermaid","nix","notion formula",
-            "objective-c","ocaml","pascal","perl","php","plain text","powershell","prolog","proto","python",
-            "r","reason","ruby","rust","sass","scala","scheme","scss","shell","smalltalk","solidity","sql",
-            "swift","tcl","toml","typescript","vb.net","vb","verilog","vhdl","vim","xml","yaml"
-        }
-        
-        # 사용자가 준 meta language를 정규화
-        lang = (meta.get("language") or "").strip()
-        lang_low = lang.lower()
-
-        # mapping for common variants
-        lang_aliases = {
-            "py": "python",
-            "py3": "python",
-            "python3": "python",
-            "csharp": "c#",
-            "cs": "c#",
-            "cpp": "c++",
-            "js": "javascript",
-            "ts": "typescript",
-            "plain": "plain text",
-            "text": "plain text",
-            # 필요하면 여기에 더 추가 가능
-        }
-
-        # 1) 직접 허용 리스트에 있는지 확인
-        chosen_lang = None
-        if lang_low in allowed_languages:
-            chosen_lang = lang_low
-        # 2) alias로 매핑 가능한지 확인
-        elif lang_low in lang_aliases:
-            chosen_lang = lang_aliases[lang_low]
-        # 3) 대소문자 문제일 수 있으니 소문자/공백 제거 후 재검사
-        else:
-            candidate = lang_low.replace(" ", "")
-            if candidate in lang_aliases:
-                chosen_lang = lang_aliases[candidate]
-            elif candidate in allowed_languages:
-                chosen_lang = candidate
-
-        # 4) 마지막 폴백: 'plain text'로 안전하게 지정
-        if not chosen_lang:
-            print(f"[INFO] language '{meta.get('language')}' not in allowed list - falling back to 'plain text'")
-            chosen_lang = "plain text"
-        
+        # Notion이 허용하는 언어 키로 매핑(확장자에서 결정된 meta['language'] 기대)
+        lang = (meta.get("language") or "").strip().lower()
+        # Notion에서 허용되는 언어를 간단히 추정 (많은 항목 허용)
+        allowed = {"python","javascript","java","c","c++","c#","rust","go","kotlin","ruby","plain text"}
+        if lang not in allowed:
+            lang = "plain text"
         children.append({
             "object": "block",
             "type": "code",
             "code": {
-                "rich_text": [
-                    {"type": "text", "text": {"content": code_snippet}}
-                ],
-                "language": chosen_lang
+                "rich_text": [{"type": "text", "text": {"content": code_snippet[:15000]}}],
+                "language": lang
             }
         })
 
-    payload = {
-        "parent": {"database_id": NOTION_DB_ID},
-        "properties": properties_payload,
-    }
+    payload = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties_payload}
     if children:
         payload["children"] = children
 
-    # 4) 요청
     url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28", "Content-Type": "application/json"}
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r = requests.post(url, headers=headers, json=payload, timeout=25)
     except Exception as e:
         print("[ERROR] Notion request exception:", e)
         return
@@ -448,8 +551,6 @@ def create_notion_page(meta: dict):
         print("[WARN] Notion create failed:", r.status_code, r.text[:1000])
     else:
         print("[OK] Notion page created:", r.json().get("id"))
-
-
 
 # -------------------
 # 연결 테스트 (디버그용)
@@ -476,6 +577,28 @@ def test_notion_connectivity():
         print("body-preview:", (r.text or "")[:400])
     except Exception as e:
         print("[Notion] exception:", e)
+
+# -------------------
+# 확장자 -> Notion 언어 매핑 유틸
+# -------------------
+def ext_to_language(path: str) -> str:
+    path = path.lower()
+    if path.endswith(".py"):
+        return "python"
+    if path.endswith(".js"):
+        return "javascript"
+    if path.endswith(".java"):
+        return "java"
+    if path.endswith(".cpp") or path.endswith(".cc") or path.endswith(".cxx") or path.endswith(".c++"):
+        return "c++"
+    if path.endswith(".c"):
+        return "c"
+    if path.endswith(".cs"):
+        return "c#"
+    if path.endswith(".kt") or path.endswith(".kts"):
+        return "kotlin"
+    # fallback
+    return "plain text"
 
 # -------------------
 # main
@@ -508,12 +631,22 @@ def main():
 
         if not changed_files:
             print("[INFO] No changed files to process. Exiting.")
-            # connectivity debug
             test_openai_connectivity()
             test_notion_connectivity()
             return
 
-        # 실제 처리: 확장자 필터
+        # README 파싱 (같은 폴더에 README가 있으면 붙여넣기)
+        attach_map = {}
+        for fpath in changed_files:
+            if fpath.endswith("README.md") or fpath.lower().endswith("readme.md"):
+                content = get_file_raw(owner, repo, fpath, ref)
+                if content:
+                    parsed_md = parse_readme(content)
+                    folder = os.path.dirname(fpath)
+                    attach_map[folder] = parsed_md
+                    print(f"[INFO] parsed README for folder {folder}: {parsed_md}")
+
+        # 처리할 확장자
         exts = [".py", ".cpp", ".c", ".java", ".js"]
         for path in changed_files:
             if not any(path.endswith(ext) for ext in exts):
@@ -523,15 +656,61 @@ def main():
             if not content:
                 print("[WARN] content not fetched for", path)
                 continue
-            parsed = classify_with_openai(content)
+
+            folder = os.path.dirname(path)
+            readme_info = attach_map.get(folder, {})
+            problem_text = readme_info.get("problem_text", "") if readme_info else ""
+            problem_url = readme_info.get("problem_url", "") if readme_info else ""
+            perf_memory = readme_info.get("perf_memory", "") if readme_info else ""
+            perf_time = readme_info.get("perf_time", "") if readme_info else ""
+            difficulty = readme_info.get("difficulty", "") if readme_info else ""
+            classification_text = readme_info.get("classification_text", "") if readme_info else ""
+            classification_tags = readme_info.get("classification_tags", []) if readme_info else []
+
+            # LLM 분류 (문제 설명 포함)
+            parsed = classify_with_openai(content, problem_text=problem_text)
+
+            # tags 병합: README 분류 우선, LLM 태그 추가, 중복 제거
+            llm_tags = parsed.get("tags", []) or []
+            tags = []
+            # 우선 README tags (원문) 넣고, LLM 태그 추가
+            for t in classification_tags + llm_tags:
+                if isinstance(t, str) and t.strip():
+                    tt = t.strip()
+                    if tt not in tags:
+                        tags.append(tt)
+
+            # language 결정
+            language = ext_to_language(path)
+
+            # --- 파일명에서 확장자 제거하고 '제목' 만들기 ---
+            filename = os.path.basename(path)            # "이어 붙인 수.py" 또는 "이어 붙인 수.py"
+            name_no_ext, _ext = os.path.splitext(filename)  # ("이어 붙인 수", ".py")
+            
+            # 정제: 유니코드 공백(넓은 공백, NBSP 등)들을 일반 공백으로 바꾸고 중복 공백은 하나로 축소
+            # 주요 유니코드 공백들: \u00A0 (NBSP), \u2000-\u200A (various spaces), \u202F, \u2005, BOM \uFEFF 등
+            title = re.sub(r'[\u00A0\u2000-\u200A\u202F\u2005\uFEFF]', ' ', name_no_ext)  # 특수 공백 정리
+            title = unescape(title)                          # 혹시 HTML 이스케이프가 있으면 되돌리기
+            title = re.sub(r'\s+', ' ', title).strip()       # 연속 공백 -> 하나, 앞뒤 공백 제거
+
+            # --- platform 추출 ---
+            raw_platform = path.split('/', 1)[0] if '/' in path else path
+            # 정리: 유니코드 공백 정리 및 앞뒤 공백 제거
+            platform = re.sub(r'[\u00A0\u2000-\u200A\u202F]', ' ', raw_platform).strip()
+
             meta = {
-                "title": f"{repo}/{path}",
-                "platform": "GitHub",
-                "tags": parsed.get("tags", []),
-                "difficulty": parsed.get("difficulty", "Unknown"),
-                "language": "Python" if path.endswith(".py") else "Other",
-                "url": f"https://github.com/{owner}/{repo}/blob/{ref}/{path}",
-                "summary": parsed.get("summary", "")[:2000],
+                "title": title,
+                "platform": platform,
+                "tags": tags,
+                "difficulty": difficulty,
+                "language": language,
+                "url": problem_url or f"https://github.com/{owner}/{repo}/blob/{ref}/{path}",
+                "problem_text": problem_text,
+                "classification_text": classification_text,
+                "review": parsed.get("review", "")[:2000],
+                "time_complexity": parsed.get("time_complexity", ""),
+                "perf_memory": perf_memory,
+                "perf_time": perf_time,
                 "code_snippet": content[:1500]
             }
             create_notion_page(meta)
@@ -540,7 +719,6 @@ def main():
         print("=== UNCAUGHT EXCEPTION ===")
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
