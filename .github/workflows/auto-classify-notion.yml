@@ -6,7 +6,8 @@ on:
   push:
     # 예: solutions/ 폴더에 있는 문제 풀이 코드가 바뀔 때만 동작하도록 제한
     paths:
-      - 'solutions/**'
+      - '백준/**'
+      - '프로그래머스/**'
       - '.github/workflows/auto-classify-notion.yml'  # 워크플로 테스트용
 
 permissions:
@@ -36,10 +37,8 @@ jobs:
       - name: Run classifier script
         env:
           # 반드시 GitHub Secrets에 저장해둔 값들을 사용하세요
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DB_ID: ${{ secrets.NOTION_DB_ID }}
-          # GITHUB_TOKEN은 기본으로 제공되지만 secrets로도 접근 가능
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENAI_API_KEY: ${{ ct_notion.OPENAI_API_KEY }}
+          NOTION_TOKEN: ${{ ct_notion.NOTION_TOKEN }}
+          NOTION_DB_ID: ${{ ct_notion.NOTION_DB_ID }}
         run: |
           python scripts/classify_and_push.py
