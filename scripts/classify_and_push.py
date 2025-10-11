@@ -168,18 +168,119 @@ def classify_with_openai(code: str) -> dict:
 # -------------------
 # Notion에 페이지 생성
 # -------------------
+# Notion에 페이지 생성 (DB 스키마 읽어서 안전하게 매핑)
+# 기존의 create_notion_page 함수를 아래로 대체하세요.
+
+_DB_SCHEMA_CACHE = None  # 프로세스 내 캐시
+
+def get_database_schema():
+    """
+    Notion 데이터베이스의 properties 스키마를 가져와서 캐시합니다.
+    반환값: dict of { property_name: property_schema_dict }
+    """
+    global _DB_SCHEMA_CACHE
+    if _DB_SCHEMA_CACHE is not None:
+        return _DB_SCHEMA_CACHE
+
+    if not NOTION_TOKEN or not NOTION_DB_ID:
+        print("[WARN] Notion creds missing - cannot fetch DB schema")
+        return {}
+
+    url = f"https://api.notion.com/v1/databases/{NOTION_DB_ID}"
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Notion-Version": "2022-06-28"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+    except Exception as e:
+        print("[ERROR] get_database_schema request exception:", e)
+        return {}
+    if r.status_code != 200:
+        print("[WARN] get_database_schema failed:", r.status_code, r.text[:1000])
+        return {}
+
+    data = r.json()
+    props = data.get("properties", {})
+    _DB_SCHEMA_CACHE = props
+    print("[Notion] DB schema fetched. properties:", list(props.keys()))
+    return props
+
+def _wrap_value_for_property(prop_schema: dict, value):
+    """
+    prop_schema: Notion property schema for that property (dict)
+    value: meta 값 (str or list)
+    반환: property payload (dict) - ready to put under properties[property_name]
+    """
+    ptype = prop_schema.get("type")
+    # 안전한 변환들
+    if ptype == "title":
+        return {"title": [{"text": {"content": str(value)}}]}
+    if ptype == "rich_text":
+        return {"rich_text": [{"type": "text", "text": {"content": str(value)}}]}
+    if ptype == "select":
+        return {"select": {"name": str(value)}}
+    if ptype == "multi_select":
+        # value가 리스트면 각각 처리, 아니면 하나로 만듦
+        if isinstance(value, (list, tuple)):
+            return {"multi_select": [{"name": str(v)} for v in value]}
+        else:
+            return {"multi_select": [{"name": str(value)}]}
+    if ptype == "url":
+        return {"url": str(value)}
+    if ptype == "number":
+        try:
+            return {"number": float(value)}
+        except Exception:
+            return {"number": None}
+    if ptype == "checkbox":
+        return {"checkbox": bool(value)}
+    if ptype == "date":
+        # value가 ISO 날짜 문자열이면 그대로 넣음 (예: "2025-10-11")
+        return {"date": {"start": str(value)}}
+    if ptype == "people":
+        # 사람은 id를 넣어야 하므로 기본으로 빈 배열
+        return {"people": []}
+    # fallback: rich_text로 넣기 (안전)
+    return {"rich_text": [{"type": "text", "text": {"content": str(value)}}]}
+
 def create_notion_page(meta: dict):
+    """
+    meta: {
+      title, platform, tags(list), difficulty, language, url, summary, code_snippet
+    }
+    이 함수를 사용하면 DB 스키마에 맞춰 properties를 생성해서 Notion에 페이지를 만듭니다.
+    """
     if not NOTION_TOKEN or not NOTION_DB_ID:
         print("[WARN] Notion creds missing, skipping create")
         return
-    url = "https://api.notion.com/v1/pages"
-    headers = {
-        "Authorization": f"Bearer {NOTION_TOKEN}",
-        "Notion-Version": "2022-06-28",
-        "Content-Type": "application/json"
+
+    # 1) DB 스키마 로드
+    schema = get_database_schema()
+    if not schema:
+        print("[WARN] DB schema unavailable, attempt minimal create with children only")
+    properties_payload = {}
+
+    # mapping: 메타 필드명 -> Notion DB 컬럼명 (사용자 DB 컬럼명이 다르다면 여기를 수정)
+    # 보통 스크린샷대로라면 "Name", "Platform", "Algorithm", "Difficulty", "Language", "URL"
+    # 필요시 여기에 DB 컬럼명과 meta 키를 조정하세요.
+    mapping = {
+        "Name": meta.get("title", ""),
+        "Platform": meta.get("platform", ""),
+        "Algorithm": meta.get("tags", []),      # list expected
+        "Difficulty": meta.get("difficulty", ""),
+        "Language": meta.get("language", ""),
+        "URL": meta.get("url", "")
     }
 
-    # Notion은 paragraph -> rich_text, code -> rich_text 형식을 기대합니다.
+    # 2) schema에 맞게 properties 구성
+    for prop_name, val in mapping.items():
+        if prop_name not in schema:
+            # DB에 해당 컬럼이 없으면 건너뜀 (또는 fallback으로 rich_text 필드에 추가)
+            print(f"[INFO] property '{prop_name}' not found in DB schema - skipping")
+            continue
+        prop_schema = schema[prop_name]
+        wrapped = _wrap_value_for_property(prop_schema, val)
+        properties_payload[prop_name] = wrapped
+
+    # 3) children (summary + code) - Notion이 요구하는 형식으로 생성
     children = []
     summary_text = meta.get("summary", "")
     if summary_text:
@@ -192,10 +293,8 @@ def create_notion_page(meta: dict):
                 ]
             }
         })
-    # 코드 블록(선택사항) — 길면 자르기
     code_snippet = meta.get("code_snippet", "")
     if code_snippet:
-        # Notion code block expects "rich_text"
         children.append({
             "object": "block",
             "type": "code",
@@ -207,16 +306,20 @@ def create_notion_page(meta: dict):
             }
         })
 
-    properties = {
-        "Name": {"title": [{"text": {"content": meta.get("title", "Unknown")}}]},
-        "Platform": {"select": {"name": meta.get("platform", "GitHub")}},
-        "Algorithm": {"multi_select": [{"name": t} for t in meta.get("tags", [])]},
-        "Difficulty": {"select": {"name": meta.get("difficulty", "Unknown")}},
-        "Language": {"select": {"name": meta.get("language", "Python")}},
-        "URL": {"url": meta.get("url")},
+    payload = {
+        "parent": {"database_id": NOTION_DB_ID},
+        "properties": properties_payload,
     }
-    payload = {"parent": {"database_id": NOTION_DB_ID}, "properties": properties, "children": children}
+    if children:
+        payload["children"] = children
 
+    # 4) 요청
+    url = "https://api.notion.com/v1/pages"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json"
+    }
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=20)
     except Exception as e:
@@ -227,6 +330,7 @@ def create_notion_page(meta: dict):
         print("[WARN] Notion create failed:", r.status_code, r.text[:1000])
     else:
         print("[OK] Notion page created:", r.json().get("id"))
+
 
 
 # -------------------
