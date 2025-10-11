@@ -295,6 +295,56 @@ def create_notion_page(meta: dict):
         })
     code_snippet = meta.get("code_snippet", "")
     if code_snippet:
+        allowed_languages = {
+            "abap","abc","agda","arduino","ascii art","assembly","bash","basic","bnf","c","c#","c++",
+            "clojure","coffeescript","coq","css","dart","dhall","diff","docker","ebnf","elixir","elm",
+            "erlang","f#","flow","fortran","gherkin","glsl","go","graphql","groovy","haskell","hcl","html",
+            "idris","java","javascript","json","julia","kotlin","latex","less","lisp","livescript","llvm ir",
+            "lua","makefile","markdown","markup","matlab","mathematica","mermaid","nix","notion formula",
+            "objective-c","ocaml","pascal","perl","php","plain text","powershell","prolog","proto","python",
+            "r","reason","ruby","rust","sass","scala","scheme","scss","shell","smalltalk","solidity","sql",
+            "swift","tcl","toml","typescript","vb.net","vb","verilog","vhdl","vim","xml","yaml"
+        }
+        
+        # 사용자가 준 meta language를 정규화
+        lang = (meta.get("language") or "").strip()
+        lang_low = lang.lower()
+
+        # mapping for common variants
+        lang_aliases = {
+            "py": "python",
+            "py3": "python",
+            "python3": "python",
+            "csharp": "c#",
+            "cs": "c#",
+            "cpp": "c++",
+            "js": "javascript",
+            "ts": "typescript",
+            "plain": "plain text",
+            "text": "plain text",
+            # 필요하면 여기에 더 추가 가능
+        }
+
+        # 1) 직접 허용 리스트에 있는지 확인
+        chosen_lang = None
+        if lang_low in allowed_languages:
+            chosen_lang = lang_low
+        # 2) alias로 매핑 가능한지 확인
+        elif lang_low in lang_aliases:
+            chosen_lang = lang_aliases[lang_low]
+        # 3) 대소문자 문제일 수 있으니 소문자/공백 제거 후 재검사
+        else:
+            candidate = lang_low.replace(" ", "")
+            if candidate in lang_aliases:
+                chosen_lang = lang_aliases[candidate]
+            elif candidate in allowed_languages:
+                chosen_lang = candidate
+
+        # 4) 마지막 폴백: 'plain text'로 안전하게 지정
+        if not chosen_lang:
+            print(f"[INFO] language '{meta.get('language')}' not in allowed list - falling back to 'plain text'")
+            chosen_lang = "plain text"
+        
         children.append({
             "object": "block",
             "type": "code",
@@ -302,7 +352,7 @@ def create_notion_page(meta: dict):
                 "rich_text": [
                     {"type": "text", "text": {"content": code_snippet}}
                 ],
-                "language": meta.get("language", "python")
+                "language": chosen_lang
             }
         })
 
